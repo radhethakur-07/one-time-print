@@ -1,5 +1,7 @@
 import { neon } from "@neondatabase/serverless";
 import { hashPassword } from "@/lib/auth/password";
+import { db } from "@/db";
+import { sql as drizzleSql } from "drizzle-orm";
 
 const DDL_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS users (
@@ -59,14 +61,19 @@ export async function bootstrapDatabase(): Promise<{ success: boolean; message: 
   }
 
   try {
-    const sql = neon(connectionString);
+    const neonSql = neon(connectionString);
 
-    // Execute each DDL statement safely one by one
+    // Execute each DDL statement safely using neonSql.unsafe / neonSql.query
     for (const statement of DDL_STATEMENTS) {
       try {
-        await sql([statement] as any);
+        if (typeof neonSql.unsafe === "function") {
+          await neonSql.unsafe(statement);
+        } else if (typeof (neonSql as any).query === "function") {
+          await (neonSql as any).query(statement);
+        } else {
+          await db.execute(drizzleSql.raw(statement));
+        }
       } catch (err: any) {
-        // Continue if index already exists
         if (!err.message?.includes("already exists")) {
           console.warn("[DDL Step Notice]:", err?.message);
         }
@@ -77,15 +84,19 @@ export async function bootstrapDatabase(): Promise<{ success: boolean; message: 
     const adminEmail = (process.env.ADMIN_EMAIL || "admin@onetimeprint.internal").toLowerCase().trim();
     const defaultPassword = process.env.ADMIN_DEFAULT_PASSWORD || "ChangeMeSecurely123!";
 
-    const existingUsers = await sql`SELECT id FROM users WHERE email = ${adminEmail} LIMIT 1`;
-    if (existingUsers.length === 0) {
-      const passwordHash = await hashPassword(defaultPassword);
-      const adminId = "admin_" + Math.random().toString(36).substring(2, 10);
-      await sql`
-        INSERT INTO users (id, email, password_hash, name, role)
-        VALUES (${adminId}, ${adminEmail}, ${passwordHash}, 'System Administrator', 'admin')
-        ON CONFLICT (email) DO NOTHING
-      `;
+    try {
+      const existingUsers = await neonSql`SELECT id FROM users WHERE email = ${adminEmail} LIMIT 1`;
+      if (existingUsers.length === 0) {
+        const passwordHash = await hashPassword(defaultPassword);
+        const adminId = "admin_" + Math.random().toString(36).substring(2, 10);
+        await neonSql`
+          INSERT INTO users (id, email, password_hash, name, role)
+          VALUES (${adminId}, ${adminEmail}, ${passwordHash}, 'System Administrator', 'admin')
+          ON CONFLICT (email) DO NOTHING
+        `;
+      }
+    } catch (userErr: any) {
+      console.warn("[User Seed Note]:", userErr?.message);
     }
 
     hasBootstrapped = true;

@@ -6,16 +6,17 @@ import { setAdminSessionCookie } from "@/lib/auth/session";
 import { loginSchema } from "@/lib/validation/schemas";
 import { checkRateLimit, getClientIpHash } from "@/lib/security/rate-limit";
 import { logAuditEvent } from "@/lib/security/audit";
-import { ensureDatabaseReady } from "@/db/bootstrap";
+import { bootstrapDatabase } from "@/db/bootstrap";
 import crypto from "crypto";
 
 export async function POST(request: NextRequest) {
   try {
-    await ensureDatabaseReady();
+    // Proactively verify / initialize schema
+    await bootstrapDatabase();
 
-    // Rate limiting: max 10 login attempts per 15 minutes per IP
+    // Rate limiting: max 15 login attempts per 15 minutes per IP
     const ipHash = getClientIpHash(request.headers);
-    const rateLimit = checkRateLimit(`login:${ipHash}`, 10, 15 * 60 * 1000);
+    const rateLimit = checkRateLimit(`login:${ipHash}`, 15, 15 * 60 * 1000);
     if (!rateLimit.allowed) {
       return NextResponse.json(
         {
@@ -39,21 +40,32 @@ export async function POST(request: NextRequest) {
     const { email, password } = parseResult.data;
     const normalizedEmail = email.toLowerCase().trim();
 
-    // Look up user by email
-    let userRecords = await db
-      .select()
-      .from(users)
-      .where(eq(users.email, normalizedEmail))
-      .limit(1);
+    // Look up user by email (with self-healing retry if table was just created)
+    let userRecords: any[] = [];
+    try {
+      userRecords = await db
+        .select()
+        .from(users)
+        .where(eq(users.email, normalizedEmail))
+        .limit(1);
+    } catch (queryErr: any) {
+      console.warn("[Initial User Query Notice]:", queryErr?.message);
+      await bootstrapDatabase();
+      userRecords = await db
+        .select()
+        .from(users)
+        .where(eq(users.email, normalizedEmail))
+        .limit(1);
+    }
 
     let user = userRecords[0];
 
-    // If no user found in DB yet (e.g. initial login with environment credentials)
+    // Check environment admin credentials
     const envAdminEmail = (process.env.ADMIN_EMAIL || "admin@onetimeprint.internal").toLowerCase().trim();
     const envDefaultPass = process.env.ADMIN_DEFAULT_PASSWORD;
 
+    // If user not in DB yet (e.g. first login)
     if (!user && (normalizedEmail === envAdminEmail || (await db.select().from(users).limit(1)).length === 0)) {
-      // First-time admin self-initialization
       const passwordHash = await hashPassword(envDefaultPass || password);
       const newAdminId = "admin_" + crypto.randomBytes(8).toString("hex");
 
@@ -90,7 +102,6 @@ export async function POST(request: NextRequest) {
 
     const isPasswordValid = await verifyPassword(password, user.passwordHash);
     if (!isPasswordValid) {
-      // Also allow matching against env password if user just updated it in Vercel
       if (envDefaultPass && password === envDefaultPass && normalizedEmail === envAdminEmail) {
         const newHash = await hashPassword(password);
         await db.update(users).set({ passwordHash: newHash }).where(eq(users.id, user.id));
@@ -135,7 +146,6 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(
       {
         error: error?.message || "An unexpected error occurred during authentication.",
-        details: process.env.NODE_ENV === "development" ? error?.stack : undefined,
       },
       { status: 500 }
     );
