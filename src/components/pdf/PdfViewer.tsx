@@ -36,6 +36,7 @@ export function PdfViewer({ token, fileName, onPrintComplete }: PdfViewerProps) 
   // Print workflow states
   const [isPrintModalOpen, setIsPrintModalOpen] = useState<boolean>(false);
   const [isAuthorizingPrint, setIsAuthorizingPrint] = useState<boolean>(false);
+  const [printProgressText, setPrintProgressText] = useState<string>("");
   const [isPrinted, setIsPrinted] = useState<boolean>(false);
   const [printError, setPrintError] = useState<string | null>(null);
 
@@ -170,10 +171,122 @@ export function PdfViewer({ token, fileName, onPrintComplete }: PdfViewerProps) 
     if (!containerRef.current || !pdfDoc) return;
     const containerWidth = containerRef.current.clientWidth - 48; // padding
     if (containerWidth > 0) {
-      // Standard A4 width is ~595px at scale 1.0
       const calculatedScale = Math.min(containerWidth / 620, 2.0);
       setZoomScale(Math.max(calculatedScale, 0.8));
     }
+  };
+
+  /**
+   * High-Resolution Dedicated PDF Print Engine:
+   * Renders EVERY page of the actual PDF at 300 DPI into an isolated hidden iframe
+   * so ONLY the pristine PDF pages are printed without website UI, headers, or buttons.
+   */
+  const executeDocumentPrint = async () => {
+    if (!pdfDoc) return;
+
+    setPrintProgressText("Rendering document pages for printer...");
+
+    const printImages: string[] = [];
+
+    // Render each page at high resolution (scale 2.0)
+    for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+      setPrintProgressText(`Preparing page ${pageNum} of ${pdfDoc.numPages}...`);
+      const page = await pdfDoc.getPage(pageNum);
+      const printScale = 2.0; // High resolution for crisp printing
+      const viewport = page.getViewport({ scale: printScale });
+
+      const offscreenCanvas = document.createElement("canvas");
+      offscreenCanvas.width = viewport.width;
+      offscreenCanvas.height = viewport.height;
+      const ctx = offscreenCanvas.getContext("2d");
+
+      if (ctx) {
+        await page.render({
+          canvasContext: ctx,
+          viewport: viewport,
+        }).promise;
+
+        printImages.push(offscreenCanvas.toDataURL("image/png"));
+      }
+    }
+
+    setPrintProgressText("Opening printer dialog...");
+
+    // Create an isolated hidden iframe to print ONLY the PDF pages
+    const iframe = document.createElement("iframe");
+    iframe.style.position = "fixed";
+    iframe.style.right = "0";
+    iframe.style.bottom = "0";
+    iframe.style.width = "0";
+    iframe.style.height = "0";
+    iframe.style.border = "0";
+    document.body.appendChild(iframe);
+
+    const doc = iframe.contentWindow?.document;
+    if (!doc) {
+      document.body.removeChild(iframe);
+      return;
+    }
+
+    const htmlContent = `
+      <!DOCTYPE html>
+      <html>
+        <head>
+          <title>${fileName}</title>
+          <style>
+            @page {
+              size: auto;
+              margin: 0mm;
+            }
+            body, html {
+              margin: 0;
+              padding: 0;
+              background: #ffffff;
+              width: 100%;
+            }
+            .pdf-page-img {
+              display: block;
+              width: 100%;
+              height: auto;
+              page-break-after: always;
+              break-after: page;
+              margin: 0;
+              padding: 0;
+            }
+            .pdf-page-img:last-child {
+              page-break-after: auto;
+              break-after: auto;
+            }
+          </style>
+        </head>
+        <body>
+          ${printImages
+            .map(
+              (src, idx) =>
+                `<img class="pdf-page-img" src="${src}" alt="Page ${idx + 1}" />`
+            )
+            .join("")}
+        </body>
+      </html>
+    `;
+
+    doc.open();
+    doc.write(htmlContent);
+    doc.close();
+
+    // Trigger printing once images in iframe are loaded
+    setTimeout(() => {
+      try {
+        iframe.contentWindow?.focus();
+        iframe.contentWindow?.print();
+      } catch (err) {
+        console.error("Iframe print error:", err);
+      } finally {
+        setTimeout(() => {
+          document.body.removeChild(iframe);
+        }, 3000);
+      }
+    }, 500);
   };
 
   // One-Time Print Execution Workflow
@@ -181,6 +294,7 @@ export function PdfViewer({ token, fileName, onPrintComplete }: PdfViewerProps) 
     try {
       setIsAuthorizingPrint(true);
       setPrintError(null);
+      setPrintProgressText("Authorizing one-time print with server...");
 
       // Server-side atomic validation and invalidation
       const response = await fetch(`/api/document/${token}/print`, {
@@ -198,6 +312,9 @@ export function PdfViewer({ token, fileName, onPrintComplete }: PdfViewerProps) 
         return;
       }
 
+      // Execute real high-resolution PDF print
+      await executeDocumentPrint();
+
       // Close modal and transition viewer into permanently consumed state
       setIsPrintModalOpen(false);
       setIsAuthorizingPrint(false);
@@ -206,11 +323,6 @@ export function PdfViewer({ token, fileName, onPrintComplete }: PdfViewerProps) 
       if (onPrintComplete) {
         onPrintComplete();
       }
-
-      // Trigger native browser print dialog
-      setTimeout(() => {
-        window.print();
-      }, 300);
     } catch (err: any) {
       setPrintError(err.message || "Network error during print initiation.");
       setIsAuthorizingPrint(false);
@@ -375,9 +487,16 @@ export function PdfViewer({ token, fileName, onPrintComplete }: PdfViewerProps) 
           <div className="p-3 bg-amber-50 border border-amber-200 rounded-md text-amber-900 text-xs leading-relaxed dark:bg-amber-950/40 dark:border-amber-800 dark:text-amber-200">
             <p className="font-semibold mb-1">Single-Use Link Consumption Notice</p>
             <p>
-              When you click &quot;Authorize &amp; Print&quot;, the server will immediately invalidate this access token. The document cannot be opened again after print initiation. Ensure your printer is powered on and connected.
+              When you click &quot;Authorize &amp; Print&quot;, the server will immediately invalidate this access token. Only the actual document pages will be sent to your printer. Ensure your printer is ready.
             </p>
           </div>
+
+          {printProgressText && (
+            <div className="flex items-center gap-2 p-2.5 bg-zinc-100 rounded-md text-xs font-mono text-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-zinc-600" />
+              <span>{printProgressText}</span>
+            </div>
+          )}
 
           {printError && (
             <div className="p-3 bg-red-50 border border-red-200 rounded-md text-red-900 text-xs dark:bg-red-950/40 dark:border-red-800 dark:text-red-200">
