@@ -1,8 +1,7 @@
-import { neon, Pool, neonConfig } from "@neondatabase/serverless";
-import { drizzle } from "drizzle-orm/neon-serverless";
+import { neon } from "@neondatabase/serverless";
+import { drizzle } from "drizzle-orm/neon-http";
 import * as schema from "./schema";
 
-// Cache the database instance across serverless invocations
 let dbInstance: ReturnType<typeof drizzle<typeof schema>> | null = null;
 
 export function getDb() {
@@ -10,13 +9,13 @@ export function getDb() {
 
   if (!connectionString) {
     throw new Error(
-      "DATABASE_URL environment variable is missing. Please configure your Neon PostgreSQL connection string in .env.local or Vercel environment variables."
+      "DATABASE_URL environment variable is missing. Please configure your Neon PostgreSQL connection string in Vercel environment variables."
     );
   }
 
   if (!dbInstance) {
-    const pool = new Pool({ connectionString });
-    dbInstance = drizzle(pool, { schema });
+    const sql = neon(connectionString);
+    dbInstance = drizzle(sql, { schema });
   }
 
   return dbInstance;

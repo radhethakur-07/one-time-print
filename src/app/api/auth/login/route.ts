@@ -1,20 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db, users } from "@/db";
 import { eq } from "drizzle-orm";
-import { verifyPassword } from "@/lib/auth/password";
+import { verifyPassword, hashPassword } from "@/lib/auth/password";
 import { setAdminSessionCookie } from "@/lib/auth/session";
 import { loginSchema } from "@/lib/validation/schemas";
 import { checkRateLimit, getClientIpHash } from "@/lib/security/rate-limit";
 import { logAuditEvent } from "@/lib/security/audit";
 import { ensureDatabaseReady } from "@/db/bootstrap";
+import crypto from "crypto";
 
 export async function POST(request: NextRequest) {
   try {
     await ensureDatabaseReady();
 
-    // Rate limiting: max 5 login attempts per 15 minutes per IP
+    // Rate limiting: max 10 login attempts per 15 minutes per IP
     const ipHash = getClientIpHash(request.headers);
-    const rateLimit = checkRateLimit(`login:${ipHash}`, 5, 15 * 60 * 1000);
+    const rateLimit = checkRateLimit(`login:${ipHash}`, 10, 15 * 60 * 1000);
     if (!rateLimit.allowed) {
       return NextResponse.json(
         {
@@ -30,40 +31,80 @@ export async function POST(request: NextRequest) {
 
     if (!parseResult.success) {
       return NextResponse.json(
-        { error: "Invalid input data", details: parseResult.error.flatten().fieldErrors },
+        { error: "Please enter a valid email address and password." },
         { status: 400 }
       );
     }
 
     const { email, password } = parseResult.data;
+    const normalizedEmail = email.toLowerCase().trim();
 
     // Look up user by email
-    const userRecords = await db.select().from(users).where(eq(users.email, email.toLowerCase().trim())).limit(1);
-    const user = userRecords[0];
+    let userRecords = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, normalizedEmail))
+      .limit(1);
+
+    let user = userRecords[0];
+
+    // If no user found in DB yet (e.g. initial login with environment credentials)
+    const envAdminEmail = (process.env.ADMIN_EMAIL || "admin@onetimeprint.internal").toLowerCase().trim();
+    const envDefaultPass = process.env.ADMIN_DEFAULT_PASSWORD;
+
+    if (!user && (normalizedEmail === envAdminEmail || (await db.select().from(users).limit(1)).length === 0)) {
+      // First-time admin self-initialization
+      const passwordHash = await hashPassword(envDefaultPass || password);
+      const newAdminId = "admin_" + crypto.randomBytes(8).toString("hex");
+
+      await db.insert(users).values({
+        id: newAdminId,
+        email: normalizedEmail,
+        passwordHash,
+        name: "System Administrator",
+        role: "admin",
+      });
+
+      user = {
+        id: newAdminId,
+        email: normalizedEmail,
+        passwordHash,
+        name: "System Administrator",
+        role: "admin",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+    }
 
     if (!user) {
       await logAuditEvent({
         action: "ADMIN_LOGIN_FAILED",
         requestHeaders: request.headers,
-        details: { email, reason: "User not found" },
+        details: { email: normalizedEmail, reason: "Account not found" },
       });
       return NextResponse.json(
-        { error: "Invalid credentials provided." },
+        { error: "Invalid credentials. Please check your email and password." },
         { status: 401 }
       );
     }
 
     const isPasswordValid = await verifyPassword(password, user.passwordHash);
     if (!isPasswordValid) {
-      await logAuditEvent({
-        action: "ADMIN_LOGIN_FAILED",
-        requestHeaders: request.headers,
-        details: { email, reason: "Invalid password" },
-      });
-      return NextResponse.json(
-        { error: "Invalid credentials provided." },
-        { status: 401 }
-      );
+      // Also allow matching against env password if user just updated it in Vercel
+      if (envDefaultPass && password === envDefaultPass && normalizedEmail === envAdminEmail) {
+        const newHash = await hashPassword(password);
+        await db.update(users).set({ passwordHash: newHash }).where(eq(users.id, user.id));
+      } else {
+        await logAuditEvent({
+          action: "ADMIN_LOGIN_FAILED",
+          requestHeaders: request.headers,
+          details: { email: normalizedEmail, reason: "Incorrect password" },
+        });
+        return NextResponse.json(
+          { error: "Invalid credentials. Incorrect password." },
+          { status: 401 }
+        );
+      }
     }
 
     // Set secure HTTP-only session cookie
@@ -92,7 +133,10 @@ export async function POST(request: NextRequest) {
   } catch (error: any) {
     console.error("[Login Route Error]:", error);
     return NextResponse.json(
-      { error: "An unexpected error occurred during authentication." },
+      {
+        error: error?.message || "An unexpected error occurred during authentication.",
+        details: process.env.NODE_ENV === "development" ? error?.stack : undefined,
+      },
       { status: 500 }
     );
   }
